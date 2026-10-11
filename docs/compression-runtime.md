@@ -1,0 +1,85 @@
+# Fixed-profile compression runtime
+
+KVServe provides a transport-independent runtime for caller-owned KV caches.
+It imports no vLLM module. Cache registration, request lifecycle and slot credit
+remain the responsibility of the transfer/storage adapter.
+
+## Installation
+
+Install the package with `runtime` and the nvCOMP extra matching the CUDA major:
+
+```bash
+uv pip install '.[runtime,runtime-cu13]'
+# CUDA 12: use runtime-cu12 instead.
+```
+
+The Python backend uses humming-kernels. Set
+`KVSERVE_COMPRESSION_BACKEND=cpp` for the optional CUDA backend; it requires a
+CUDA compiler and ninja and builds during cache binding, before requests arrive.
+The runtime ships its JIT source files in the wheel. Importing `kvserve_v1` no
+longer loads the optional legacy vLLM connector; its existing exported name is
+resolved when requested.
+
+## API version 1
+
+```python
+from kvserve_v1.compression.runtime import (
+    API_VERSION, CacheSpec, CompressionConfig, CompressionRuntime, build_memory_plan,
+)
+
+config = CompressionConfig.from_extra_config({
+    "compression": {"enable-compression-pipeline": True,
+                    "logical_blocks_per_chunk": 64},
+})
+# Supply an explicit layer index; names need not follow a model naming convention.
+specs = {name: CacheSpec(layer_index, block_size, kv_heads,
+                        key_head_size, dtype, value_head_size)}
+plan = build_memory_plan(config, specs, blocks_per_logical=physical_factor,
+                         tp_size=tp_size, tp_rank=tp_rank,
+                         num_layers=num_layers, device=device)
+# Reserve plan.reserved_bytes before allocating the inference KV cache.
+runtime = CompressionRuntime(plan, "HND", physical_factor, device)
+runtime.bind_kv_caches(cache_tensors, layer_to_group)
+addresses, lengths = runtime.registered_memory()
+
+encoded = runtime.encode(slot_id, block_ids_by_group, kv_part,
+                         valid_tokens_by_group=valid_tokens)
+encoded.event.synchronize()  # before the transfer engine reads the payload
+# Transfer payload, runtime.aux_bytes(...) and encoded.raw_tail_bytes.
+# The receiver must use distinct local buffers and the same wire_profile.
+event = receiver.decode(receiver_slot, destination_blocks, kv_part,
+                        encoded.codec_bytes, encoded.u8_bytes,
+                        valid_tokens_by_group=valid_tokens)
+event.synchronize()  # before making destination cache visible or returning credit
+```
+
+This is a fixed-profile API. Layout and head selection are planned once;
+head orders/signs are initialized once when caches bind. Buffers are bounded,
+preallocated and owned by the runtime. Encode/decode never perform a network
+operation. Callers can register the single pool and address its slot views.
+
+Supported caches are dense BF16 HND/LBHNC with separate K/V views, including
+different K/V head sizes. Complete blocks enter transform/quantizer/ANS; partial
+tails are transferred raw. Configure `pipeline=["codec"]` for lossless ANS-only.
+Head profiles include TP slicing and replicated KV-head mappings. CUDA supports
+a single FullAttention group; unsupported combinations fail explicitly.
+
+## Ownership and compatibility
+
+The adapter must fence the source cache before encode, wait for encode before
+network reads, wait for received bytes before decode, and retain each receiver
+slot until decode completes. Shutdown is safe only after outstanding transfers
+and engine jobs have drained. `shutdown()` fences runtime streams and releases
+its codec resources; it cannot stop remote writes.
+
+Profile version 2 fingerprints the static representation and rejects older
+profile versions; both endpoints must be upgraded together. Slot count and the
+local score-file path do not affect peer representation identity.
+
+nvCOMP uses a process-global allocator. While active, KVServe routes its streams
+to fixed workspaces and ordinary external codec streams to independent
+allocations, restoring the SDK default after the last runtime stops. Arbitrary
+external custom nvCOMP allocators are unsupported.
+
+Numerical/kernel tests live in `tests/runtime`; vLLM separately tests cache
+adaptation, Mooncake integration, disabled behavior and lifecycle safety.

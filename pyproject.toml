@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kvserve_v1"
-version = "0.1.0"
+version = "0.2.0"
 requires-python = ">=3.10"
 license = {text = "Apache-2.0"}
 dependencies = [
@@ -13,6 +13,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+runtime = ["torch>=2.6", "numpy", "humming-kernels>=0.1.16"]
+runtime-cu12 = ["nvidia-nvcomp-cu12==5.3.0.16"]
+runtime-cu13 = ["nvidia-nvcomp-cu13==5.3.0.16"]
 fused = ["tilelang==0.1.9", "scipy>=1.10"]
 
 [tool.setuptools.packages.find]
@@ -21,3 +24,5 @@ include = ["kvserve_v1*"]
 
 [tool.setuptools.package-data]
 "kvserve_v1.compression.config.duo_config" = ["*.csv"]
+
+"kvserve_v1.compression.runtime" = ["csrc/*.cpp", "csrc/*.cu", "csrc/*.h"]

@@ -324,3 +324,7 @@ If you find KVServe useful for your research, please consider citing our paper:
 ## License
 
 Apache-2.0
+
+### Compression runtime API
+
+A transport-independent fixed-profile runtime for external KV caches, with Python/CUDA backends and bounded buffers, is documented in [the runtime guide](docs/compression-runtime.md). vLLM adapters can use it without importing the legacy KVServe connector.
