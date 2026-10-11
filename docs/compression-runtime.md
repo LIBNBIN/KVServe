@@ -6,12 +6,17 @@ remain the responsibility of the transfer/storage adapter.
 
 ## Installation
 
-Install the package with `runtime` and the nvCOMP extra matching the CUDA major:
+Install the package with `runtime` and the nvCOMP extra matching the CUDA major.
+Consumers do not need to clone KVServe or add its source tree to `PYTHONPATH`;
+the immutable source archive is built and installed as a normal wheel:
 
 ```bash
-uv pip install '.[runtime,runtime-cu13]'
+uv pip install 'kvserve_v1[runtime,runtime-cu13] @ https://github.com/hpdps-group/KVServe/archive/7482d69a07165022812af0643991655b0f97011b.tar.gz'
 # CUDA 12: use runtime-cu12 instead.
 ```
+
+For KVServe development from a local checkout, use
+`uv pip install '.[runtime,runtime-cu13]'` instead.
 
 The Python backend uses humming-kernels. Set
 `KVSERVE_COMPRESSION_BACKEND=cpp` for the optional CUDA backend; it requires a
