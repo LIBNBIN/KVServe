@@ -11,7 +11,7 @@ Consumers do not need to clone KVServe or add its source tree to `PYTHONPATH`;
 the immutable source archive is built and installed as a normal wheel:
 
 ```bash
-uv pip install 'kvserve_v1[runtime,runtime-cu13] @ https://github.com/hpdps-group/KVServe/archive/7482d69a07165022812af0643991655b0f97011b.tar.gz'
+uv pip install 'kvserve_v1[runtime,runtime-cu13] @ https://github.com/hpdps-group/KVServe/archive/92489f1a347fc15ffe366cabdb5c63d63a9cde77.tar.gz'
 # CUDA 12: use runtime-cu12 instead.
 ```
 
