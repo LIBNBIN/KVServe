@@ -25,6 +25,11 @@ The runtime ships its JIT source files in the wheel. Importing `kvserve_v1` no
 longer loads the optional legacy vLLM connector; its existing exported name is
 resolved when requested.
 
+The CUDA backend uses cooperative channel/token reductions and quantization,
+preserving the fixed-profile BF16 operation order and buffer layout. Each
+layer section still uses one quantization kernel and needs no extra global
+workspace.
+
 ## API version 1
 
 ```python

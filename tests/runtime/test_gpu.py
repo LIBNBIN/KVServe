@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import pytest
 import torch
+
 from kvserve_v1.compression.runtime import (
     CacheSpec,
     CompressionConfig,
@@ -242,7 +243,7 @@ def test_raw_aggregate_multiple_chunks_reuse_slots_exactly(make_manager):
         raw_aggregate={"slot_count": 2, "logical_blocks_per_chunk": 1}
     )
     for chunk in range(8):
-        block, count, part = chunk_window(chunk, 4, 1)
+        block, _count, part = chunk_window(chunk, 4, 1)
         slot = chunk % 2
         section = slice(part * 8, (part + 1) * 8)
         source = cache[block, :, :, section].clone()
@@ -466,6 +467,66 @@ def test_quantizer_matches_numpy_reference(make_manager, monkeypatch, axis):
         result = cache[1, :, :, section].permute(1, 0, 2).float().cpu().numpy()
         bound = step * 0.65 + np.maximum(np.abs(low), np.abs(high)) * 0.02
         assert np.all(np.abs(result - x) <= bound)
+
+
+@pytest.mark.parametrize("axis", ["channel", "token"])
+@pytest.mark.parametrize(
+    "pattern,levels",
+    [("random", 4), ("random", 6), ("constant", 12), ("tiny", 8), ("zeros", 16)],
+)
+def test_quantization_preserves_bf16_rounding_and_aux(
+    make_manager, axis, pattern, levels
+):
+    config = {
+        "pipeline": ["quantizer"],
+        "logical_blocks_per_chunk": 2,
+        "axis_key": axis,
+        "axis_value": axis,
+        **dict.fromkeys(
+            (
+                "high_key_num_levels",
+                "low_key_num_levels",
+                "high_value_num_levels",
+                "low_value_num_levels",
+            ),
+            levels,
+        ),
+    }
+    manager, cache = make_manager(config)
+    cache.sub_(0.5)
+    if pattern == "constant":
+        cache.fill_(-3.125)
+    elif pattern == "tiny":
+        cache.mul_(1e-6)
+    elif pattern == "zeros":
+        cache.zero_()
+        cache[..., ::2] = -0.0
+    torch.accelerator.synchronize()
+    order = manager.pipelines[0].head_orders[LAYER_NAME].cpu()
+    for part in (0, 1):
+        x = cache[:2, :, :, part * 8 : (part + 1) * 8].cpu()
+        x = x.index_select(1, order).permute(0, 2, 1, 3)
+        dims = (0, 1) if axis == "channel" else (2, 3)
+        minimum = x.amin(dims, keepdim=True)
+        maximum = x.amax(dims, keepdim=True)
+        scale = ((maximum - minimum).clamp_min(1e-5).float() / (levels - 1)).to(x.dtype)
+        inverse = scale.float().reciprocal().to(x.dtype)
+        shifted = (x.float() - minimum.float()).to(x.dtype)
+        expected = (shifted.float() * inverse.float()).to(x.dtype).float()
+        expected = expected.round().clamp(0, levels - 1).to(torch.uint8)
+        encoded = manager.encode(0, [[0, 1]], part, valid_tokens_by_group={0: 32})
+        encoded.event.synchronize()
+        actual = manager.slots[0].arena_a[: encoded.u8_bytes].cpu().reshape(x.shape)
+        assert torch.equal(actual, expected)
+        section = manager.layout.parts(part)[0].sections[0]
+        for offset, value in (
+            (section.aux_min_offset, minimum),
+            (section.aux_scale_offset, scale),
+        ):
+            actual_aux = manager.slots[0].aux[offset : offset + value.numel() * 2].cpu()
+            assert torch.equal(
+                actual_aux, value.contiguous().view(torch.uint8).flatten()
+            )
 
 
 @pytest.mark.parametrize(

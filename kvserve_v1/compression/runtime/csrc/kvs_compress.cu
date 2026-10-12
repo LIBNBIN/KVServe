@@ -24,6 +24,9 @@ namespace {
 using bf16 = __nv_bfloat16;
 
 constexpr int kThreads = 256;
+constexpr int kWarpSize = 32;
+constexpr int kChannelTile = 8;
+constexpr int kTokensPerBlock = kThreads / kWarpSize;
 
 __device__ __forceinline__ float to_f32(bf16 x) { return __bfloat162float(x); }
 __device__ __forceinline__ bf16 rn(float x) { return __float2bfloat16_rn(x); }
@@ -110,86 +113,125 @@ __global__ void scale_kernel(bf16* __restrict__ data, float scale,
   data[idx] = rn(to_f32(data[idx]) * scale);
 }
 
-// Quantize along the channel axis: aux entry per (head, dim), reduced over
-// valid tokens.  Source layout is [tokens, heads, head_size].
+struct QuantParams {
+  bf16 minimum;
+  bf16 maximum;
+  bf16 scale;
+  bf16 inverse;
+};
+
+__device__ __forceinline__ QuantParams quant_params(float mn, float mx,
+                                                   int levels) {
+  const bf16 minimum = rn(mn);
+  const bf16 maximum = rn(mx);
+  float raw = to_f32(rn(to_f32(maximum) - to_f32(minimum)));
+  if (raw < 1e-5f) raw = to_f32(rn(1e-5f));
+  const bf16 scale = rn(raw / static_cast<float>(levels - 1));
+  return {minimum, maximum, scale, rn(1.0f / to_f32(scale))};
+}
+
+__device__ __forceinline__ uint8_t quant_value(bf16 value, bf16 minimum,
+                                             bf16 inverse, int levels) {
+  float v = to_f32(value) - to_f32(minimum);
+  v = to_f32(rn(v)) * to_f32(inverse);
+  float q = rintf(to_f32(rn(v)));
+  if (q < 0.0f) q = 0.0f;
+  if (q > static_cast<float>(levels - 1)) q = static_cast<float>(levels - 1);
+  return static_cast<uint8_t>(q);
+}
+
+// Eight adjacent channels share a block; 32 token lanes reduce each channel.
+// Each warp reads four contiguous groups of eight values. Reduction and
+// quantization share this tile, avoiding another launch or global scratch.
 __global__ void quantize_channel_kernel(
     const bf16* __restrict__ src, uint8_t* __restrict__ out,
     bf16* __restrict__ aux_min, bf16* __restrict__ aux_scale,
     bf16* __restrict__ tmp_max, bf16* __restrict__ tmp_inv, int tokens,
     int heads, int head_start, int head_count, int head_size, int levels) {
-  const int column = blockIdx.x * blockDim.x + threadIdx.x;
-  if (column >= head_count * head_size) return;
+  __shared__ float minima[kThreads / kWarpSize][kChannelTile];
+  __shared__ float maxima[kThreads / kWarpSize][kChannelTile];
+  const int c = threadIdx.x % kChannelTile;
+  const int token_lane = threadIdx.x / kChannelTile;
+  const int column = blockIdx.x * kChannelTile + c;
+  const bool valid = column < head_count * head_size;
   const int h = head_start + column / head_size;
   const int d = column % head_size;
   float mn = INFINITY;
   float mx = -INFINITY;
-  for (int t = 0; t < tokens; ++t) {
-    const float v =
-        to_f32(src[(static_cast<int64_t>(t) * heads + h) * head_size + d]);
-    mn = fminf(mn, v);
-    mx = fmaxf(mx, v);
+  if (valid) {
+    for (int t = token_lane; t < tokens; t += kThreads / kChannelTile) {
+      const float v =
+          to_f32(src[(static_cast<int64_t>(t) * heads + h) * head_size + d]);
+      mn = fminf(mn, v);
+      mx = fmaxf(mx, v);
+    }
   }
-  const bf16 mn_b = rn(mn);
-  const bf16 mx_b = rn(mx);
-  aux_min[column] = mn_b;
-  tmp_max[column] = mx_b;
-  float raw = to_f32(rn(to_f32(mx_b) - to_f32(mn_b)));
-  if (raw < 1e-5f) raw = to_f32(rn(1e-5f));
-  const bf16 scale = rn(raw / static_cast<float>(levels - 1));
-  aux_scale[column] = scale;
-  const bf16 inv = rn(1.0f / to_f32(scale));
-  tmp_inv[column] = inv;
-  for (int t = 0; t < tokens; ++t) {
-    const int64_t idx = (static_cast<int64_t>(t) * heads + h) * head_size + d;
-    float v = to_f32(src[idx]) - to_f32(mn_b);
-    v = to_f32(rn(v)) * to_f32(inv);
-    float q = rintf(to_f32(rn(v)));
-    if (q < 0.0f) q = 0.0f;
-    if (q > static_cast<float>(levels - 1)) q = static_cast<float>(levels - 1);
-    out[idx] = static_cast<uint8_t>(q);
+  for (int offset = kChannelTile; offset < kWarpSize; offset <<= 1) {
+    mn = fminf(mn, __shfl_xor_sync(0xffffffff, mn, offset));
+    mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, offset));
+  }
+  if (threadIdx.x % kWarpSize < kChannelTile) {
+    minima[threadIdx.x / kWarpSize][c] = mn;
+    maxima[threadIdx.x / kWarpSize][c] = mx;
+  }
+  __syncthreads();
+  if (threadIdx.x < kChannelTile && valid) {
+    for (int warp = 1; warp < kThreads / kWarpSize; ++warp) {
+      mn = fminf(mn, minima[warp][c]);
+      mx = fmaxf(mx, maxima[warp][c]);
+    }
+    const QuantParams p = quant_params(mn, mx, levels);
+    aux_min[column] = p.minimum;
+    tmp_max[column] = p.maximum;
+    aux_scale[column] = p.scale;
+    tmp_inv[column] = p.inverse;
+    minima[0][c] = to_f32(p.minimum);
+    maxima[0][c] = to_f32(p.inverse);
+  }
+  __syncthreads();
+  if (valid) {
+    const bf16 minimum = rn(minima[0][c]);
+    const bf16 inverse = rn(maxima[0][c]);
+    for (int t = token_lane; t < tokens; t += kThreads / kChannelTile) {
+      const int64_t idx = (static_cast<int64_t>(t) * heads + h) * head_size + d;
+      out[idx] = quant_value(src[idx], minimum, inverse, levels);
+    }
   }
 }
 
-// Quantize along the token axis: aux entry per token, reduced over heads/dims.
+// A warp cooperates on one token, reading consecutive head/dimension values.
 __global__ void quantize_token_kernel(
     const bf16* __restrict__ src, uint8_t* __restrict__ out,
     bf16* __restrict__ aux_min, bf16* __restrict__ aux_scale,
     bf16* __restrict__ tmp_max, bf16* __restrict__ tmp_inv, int tokens,
     int heads, int head_start, int head_count, int head_size, int levels) {
-  const int t = blockIdx.x * blockDim.x + threadIdx.x;
+  const int t = blockIdx.x * kTokensPerBlock + threadIdx.x / kWarpSize;
   if (t >= tokens) return;
+  const int lane = threadIdx.x % kWarpSize;
+  const int columns = head_count * head_size;
   const int64_t row_base = static_cast<int64_t>(t) * heads * head_size;
+  const int first = head_start * head_size;
   float mn = INFINITY;
   float mx = -INFINITY;
-  for (int h = head_start; h < head_start + head_count; ++h) {
-    for (int d = 0; d < head_size; ++d) {
-      const float v =
-          to_f32(src[row_base + static_cast<int64_t>(h) * head_size + d]);
-      mn = fminf(mn, v);
-      mx = fmaxf(mx, v);
-    }
+  for (int c = lane; c < columns; c += kWarpSize) {
+    const float v = to_f32(src[row_base + first + c]);
+    mn = fminf(mn, v);
+    mx = fmaxf(mx, v);
   }
-  const bf16 mn_b = rn(mn);
-  const bf16 mx_b = rn(mx);
-  aux_min[t] = mn_b;
-  tmp_max[t] = mx_b;
-  float raw = to_f32(rn(to_f32(mx_b) - to_f32(mn_b)));
-  if (raw < 1e-5f) raw = to_f32(rn(1e-5f));
-  const bf16 scale = rn(raw / static_cast<float>(levels - 1));
-  aux_scale[t] = scale;
-  const bf16 inv = rn(1.0f / to_f32(scale));
-  tmp_inv[t] = inv;
-  for (int h = head_start; h < head_start + head_count; ++h) {
-    for (int d = 0; d < head_size; ++d) {
-      const int64_t idx = row_base + static_cast<int64_t>(h) * head_size + d;
-      float v = to_f32(src[idx]) - to_f32(mn_b);
-      v = to_f32(rn(v)) * to_f32(inv);
-      float q = rintf(to_f32(rn(v)));
-      if (q < 0.0f) q = 0.0f;
-      if (q > static_cast<float>(levels - 1))
-        q = static_cast<float>(levels - 1);
-      out[idx] = static_cast<uint8_t>(q);
-    }
+  for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
+    mn = fminf(mn, __shfl_xor_sync(0xffffffff, mn, offset));
+    mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, offset));
+  }
+  const QuantParams p = quant_params(mn, mx, levels);
+  if (lane == 0) {
+    aux_min[t] = p.minimum;
+    tmp_max[t] = p.maximum;
+    aux_scale[t] = p.scale;
+    tmp_inv[t] = p.inverse;
+  }
+  for (int c = lane; c < columns; c += kWarpSize) {
+    const int64_t idx = row_base + first + c;
+    out[idx] = quant_value(src[idx], p.minimum, p.inverse, levels);
   }
 }
 
@@ -494,15 +536,16 @@ void encode_part(const PartDesc& p, const int64_t* indices,
             reinterpret_cast<bf16*>(aux + aux_half + s.aux_scale_offset);
         if (s.axis == KVS_AXIS_CHANNEL) {
           const int count = s.head_count * p.head_size;
-          quantize_channel_kernel<<<blocks_for(count), kThreads, 0, stream>>>(
+          quantize_channel_kernel<<<ceil_div(count, kChannelTile), kThreads, 0,
+                                    stream>>>(
               reinterpret_cast<const bf16*>(canonical_a), u8, aux_min,
               aux_scale, tmp_max, tmp_inv, static_cast<int>(body_tokens),
               p.num_heads, s.head_start, s.head_count, p.head_size,
               s.num_levels);
           check_launch("quantize_channel");
         } else {
-          quantize_token_kernel<<<blocks_for(body_tokens), kThreads, 0,
-                                  stream>>>(
+          quantize_token_kernel<<<ceil_div(body_tokens, kTokensPerBlock), kThreads,
+                                  0, stream>>>(
               reinterpret_cast<const bf16*>(canonical_a), u8, aux_min,
               aux_scale, tmp_max, tmp_inv, static_cast<int>(body_tokens),
               p.num_heads, s.head_start, s.head_count, p.head_size,
