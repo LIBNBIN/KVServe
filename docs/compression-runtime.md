@@ -8,22 +8,33 @@ remain the responsibility of the transfer/storage adapter.
 
 Install the package with `runtime` and the nvCOMP extra matching the CUDA major.
 Consumers do not need to clone KVServe or add its source tree to `PYTHONPATH`;
-the immutable source archive is built and installed as a normal wheel:
+the current `v1` source archive is built and installed as a normal wheel:
 
 ```bash
-uv pip install 'kvserve_v1[runtime,runtime-cu13] @ https://github.com/hpdps-group/KVServe/archive/92489f1a347fc15ffe366cabdb5c63d63a9cde77.tar.gz'
+uv pip install 'kvserve_v1[runtime,runtime-cu13] @ https://github.com/hpdps-group/KVServe/archive/refs/heads/v1.tar.gz'
 # CUDA 12: use runtime-cu12 instead.
+export KVSERVE_COMPRESSION_BACKEND=cpp
 ```
+
+For reproducible deployments, replace `refs/heads/v1` with a full commit SHA
+containing this dependency change. Older pinned archives retain their original
+dependencies, including Humming.
 
 For KVServe development from a local checkout, use
 `uv pip install '.[runtime,runtime-cu13]'` instead.
 
-The Python backend uses humming-kernels. Set
-`KVSERVE_COMPRESSION_BACKEND=cpp` for the optional CUDA backend; it requires a
-CUDA compiler and ninja and builds during cache binding, before requests arrive.
+The runtime extras do not install `humming-kernels`. Set
+`KVSERVE_COMPRESSION_BACKEND=cpp` in both producer and consumer environments
+before startup to use the CUDA backend without Humming. It requires a CUDA
+compiler and ninja and builds during cache binding, before requests arrive.
 The runtime ships its JIT source files in the wheel. Importing `kvserve_v1` no
 longer loads the optional legacy vLLM connector; its existing exported name is
 resolved when requested.
+
+The backend defaults to `python`. If using that backend with a `transformer`
+stage, install Humming explicitly with `uv pip install 'humming-kernels>=0.1.16'`
+and set `KVSERVE_COMPRESSION_BACKEND=python`. Python pipelines without a
+`transformer` stage do not require Humming.
 
 The CUDA backend uses cooperative channel/token reductions and quantization,
 preserving the fixed-profile BF16 operation order and buffer layout. Each
