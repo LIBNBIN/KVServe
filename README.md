@@ -1,5 +1,8 @@
 # KVServe
 
+DCU/HIP runtime API 1 adaptation: [build, configuration and validation](docs/dcu_runtime.md).
+Use an explicit hipCOMP profile on DCU; the original `default` ANS profile is unchanged.
+
 [![vLLM V1](https://img.shields.io/badge/vLLM-V1-4b5563)](https://github.com/vllm-project/vllm)
 ![KV compression](https://img.shields.io/badge/KV%20compression-9x-2563eb)
 ![PD communication](https://img.shields.io/badge/PD%20comm-8x%20faster-16a34a)

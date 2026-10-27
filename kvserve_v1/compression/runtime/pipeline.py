@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import math
-import threading
 from dataclasses import dataclass
 from logging import DEBUG
 from logging import getLogger as init_logger
@@ -12,7 +11,8 @@ from logging import getLogger as init_logger
 import torch
 
 from . import cpp_backend
-from .codec import ANSCodec, EncodedChunk
+from .codec import EncodedChunk, RuntimeCodec
+from .hadamard import normalized_fwht
 from .layout import CompressionLayout, KVPart, LayerPartLayout, QuantSection
 
 
@@ -34,7 +34,7 @@ class CompressionPipeline:
         kv_cache_layout: str,
         blocks_per_logical: int,
         slots: list[CompressionSlotBuffers],
-        codec: ANSCodec | None,
+        codec: RuntimeCodec | None,
         stream: torch.cuda.Stream,
         signs: dict[tuple[str, KVPart], torch.Tensor],
         head_orders: dict[str, torch.Tensor],
@@ -268,41 +268,8 @@ class CompressionPipeline:
         outputs: torch.Tensor,
         block_size: int,
     ) -> None:
-        """Run normalized FWHT using the two preallocated arena buffers.
-
-        Humming's JIT runtime requires its call site to be the process main
-        thread, while Mooncake serves compression requests from an asyncio
-        worker thread. The buffer-ping-pong implementation keeps the same
-        normalized Walsh-Hadamard transform without allocating a temporary
-        CUDA tensor in the request path.
-        """
-        if threading.current_thread() is threading.main_thread():
-            from humming.ops import process_input
-
-            process_input(
-                inputs.reshape(-1, block_size),
-                hadamard_block_size=block_size,
-                outputs=outputs.reshape(-1, block_size),
-            )
-            return
-
-        src = inputs.reshape(-1, block_size)
-        output_flat = outputs.reshape(-1, block_size)
-        dst = output_flat
-        step = 1
-        while step < block_size:
-            src_pairs = src.view(-1, block_size // (2 * step), 2, step)
-            dst_pairs = dst.view(-1, block_size // (2 * step), 2, step)
-            even = src_pairs[:, :, 0, :]
-            odd = src_pairs[:, :, 1, :]
-            torch.add(even, odd, out=dst_pairs[:, :, 0, :])
-            torch.sub(even, odd, out=dst_pairs[:, :, 1, :])
-            src, dst = dst, src
-            step <<= 1
-
-        if src.data_ptr() != output_flat.data_ptr():
-            output_flat.copy_(src)
-        output_flat.mul_(1.0 / math.sqrt(block_size))
+        """Same normalized transform on main and worker threads, on HIP or CUDA."""
+        normalized_fwht(inputs, outputs, block_size)
 
     @staticmethod
     def _axes(section: QuantSection) -> tuple[int, ...]:

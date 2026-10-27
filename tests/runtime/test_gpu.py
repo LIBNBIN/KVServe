@@ -51,10 +51,8 @@ def make_manager(monkeypatch):
             extra["raw_aggregate"] = raw_aggregate
         config = CompressionConfig.from_extra_config(extra)
         dependencies = []
-        if config.uses_codec:
+        if config.uses_codec and config.codec == "ans":
             dependencies.append("nvidia.nvcomp")
-        if config.uses_transformer and not cpp_backend.enabled():
-            dependencies.append("humming.ops")
         for dependency in dependencies:
             if os.environ.get("VLLM_TEST_REQUIRE_MOONCAKE_COMPRESSION") == "1":
                 importlib.import_module(dependency)

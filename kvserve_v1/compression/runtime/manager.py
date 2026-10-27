@@ -146,7 +146,7 @@ class CompressionRuntime:
                 self.workspace_allocators,
             )
         )
-        if self.config.uses_codec:
+        if self.config.uses_codec and self.config.codec == "ans":
             register_workspace_allocators(self._workspace_by_stream)
             self._owns_nvcomp_allocator = True
         try:
@@ -155,7 +155,7 @@ class CompressionRuntime:
             from .codec import ANSCodec
 
             self.pipelines: list[CompressionPipeline] = []
-            for stream in self.streams:
+            for slot_index, stream in enumerate(self.streams):
                 orders: dict[str, torch.Tensor] = {}
                 signs: dict[tuple[str, KVPart], torch.Tensor] = {}
                 for part in self.layout.layer_parts:
@@ -170,11 +170,20 @@ class CompressionRuntime:
                         .view(part.dtype)
                         .view(1, 1, part.num_heads, part.head_size)
                     )
-                codec = (
-                    ANSCodec(stream, self.layout.packed_bytes_by_part)
-                    if self.config.uses_codec
-                    else None
-                )
+                codec = None
+                if self.config.uses_codec:
+                    if self.config.codec == "ans":
+                        codec = ANSCodec(stream, self.layout.packed_bytes_by_part)
+                    else:
+                        from .hipcomp import HIPCOMPCodec
+
+                        codec = HIPCOMPCodec(
+                            stream,
+                            self.layout.packed_bytes_by_part,
+                            self.workspace_allocators[slot_index].buffer,
+                            self.config.codec,
+                            self.config.hipcomp_chunk_bytes,
+                        )
                 self.pipelines.append(
                     CompressionPipeline(
                         layout=self.layout,
@@ -282,7 +291,7 @@ class CompressionRuntime:
         layout_description = asdict(self.layout)
         layout_description["fa_group_indices"] = sorted(self.layout.fa_group_indices)
         wire_layout = {
-            "version": 2,
+            "version": 3,
             "config": config,
             "layout": layout_description,
             "cache_layout": self.pipelines[0].kv_cache_layout,

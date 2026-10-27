@@ -14,6 +14,7 @@ import torch
 
 from .config import CompressionConfig
 from .cpp_backend import enabled as cpp_backend_enabled
+from .hadamard import normalized_fwht
 from .layout import ALIGNMENT, CompressionLayout, build_compression_layout
 from .scores import HeadSelection, _load_scores, build_head_selection
 from .spec import CacheSpec, round_up
@@ -119,7 +120,13 @@ def _probe_operators(
     device: torch.device,
     sizes: tuple[int, ...],
     warm_hadamard: bool,
+    codec_name: str = "ans",
+    hipcomp_chunk_bytes: int = 16384,
 ) -> tuple[int, tuple[int, int], int]:
+    if codec_name != "ans":
+        return _probe_hipcomp(
+            layout, device, sizes, warm_hadamard, codec_name, hipcomp_chunk_bytes
+        )
     from nvidia import nvcomp
 
     torch.accelerator.synchronize(device)
@@ -134,18 +141,12 @@ def _probe_operators(
     hadamard_input = hadamard_output = None
     try:
         if warm_hadamard:
-            from humming.ops import process_input
-
             head_size = layout.layer_parts[0].head_size
             hadamard_input = torch.empty(
                 (1, head_size), dtype=torch.bfloat16, device=device
             )
             hadamard_output = torch.empty_like(hadamard_input)
-            process_input(
-                hadamard_input,
-                hadamard_block_size=head_size,
-                outputs=hadamard_output,
-            )
+            normalized_fwht(hadamard_input, hadamard_output, head_size)
 
         codec = nvcomp.Codec(algorithm="ANS", cuda_stream=stream.cuda_stream)
         probe_sizes = sorted(set(sizes))
@@ -211,6 +212,68 @@ def _probe_operators(
     return round_up(audit.peak_bytes, ALIGNMENT), (max(max_outputs),) * 2, retained
 
 
+def _probe_hipcomp(layout, device, sizes, warm_hadamard, codec_name, chunk_bytes):
+    from .hipcomp import HIPCOMPCodec, native_library, validate_hip_backend
+
+    validate_hip_backend(device)
+    with torch.cuda.device(device):
+        bounds = native_library().plan(codec_name, max(sizes), chunk_bytes)
+        torch.cuda.synchronize(device)
+        free_before, _ = torch.cuda.mem_get_info(device)
+        stream = torch.cuda.Stream(device=device)
+        with torch.cuda.stream(stream):
+            workspace = torch.empty(
+                bounds.workspace_bytes, device=device, dtype=torch.uint8
+            )
+            source = torch.zeros(max(sizes), device=device, dtype=torch.uint8)
+            output = torch.empty(
+                bounds.max_output_bytes, device=device, dtype=torch.uint8
+            )
+            decoded = torch.empty_like(source)
+            codec = HIPCOMPCodec(stream, sizes, workspace, codec_name, chunk_bytes)
+            event = torch.cuda.Event()
+            hadamard_input = hadamard_output = None
+            encoded = None
+            try:
+                if warm_hadamard:
+                    head_size = layout.layer_parts[0].head_size
+                    hadamard_input = torch.zeros(
+                        (1, head_size), device=device, dtype=torch.bfloat16
+                    )
+                    hadamard_output = torch.empty_like(hadamard_input)
+                    normalized_fwht(hadamard_input, hadamard_output, head_size)
+                for size in sorted(set(sizes)):
+                    encoded = codec.encode(source, output, size, event)
+                    codec.decode(output, decoded, encoded.codec_bytes, size, event)
+                    if not torch.equal(source[:size], decoded[:size]):
+                        raise RuntimeError(
+                            "hipCOMP sizing probe failed lossless roundtrip"
+                        )
+            finally:
+                stream.synchronize()
+        del (
+            codec,
+            event,
+            workspace,
+            source,
+            output,
+            decoded,
+            encoded,
+            hadamard_input,
+            hadamard_output,
+            stream,
+        )
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize(device)
+        free_after, _ = torch.cuda.mem_get_info(device)
+    return (
+        bounds.workspace_bytes,
+        (bounds.max_output_bytes,) * 2,
+        max(0, free_before - free_after),
+    )
+
+
 def build_memory_plan(
     config: CompressionConfig,
     specs: dict[str, CacheSpec],
@@ -270,6 +333,8 @@ def build_memory_plan(
             device,
             layout.packed_bytes_by_part,
             transformer and not cpp_backend_enabled(),
+            config.codec,
+            config.hipcomp_chunk_bytes,
         )
         if codec_enabled
         else (0, (0, 0), 0)

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from logging import getLogger as init_logger
+from typing import Protocol
 
 import torch
 
@@ -25,6 +26,25 @@ class EncodedChunk:
         if self.payload_bytes is not None:
             return self.payload_bytes
         return int(self.array.buffer_size)  # type: ignore[attr-defined]
+
+
+class RuntimeCodec(Protocol):
+    def encode(
+        self,
+        source: torch.Tensor,
+        output: torch.Tensor,
+        u8_bytes: int,
+        event: torch.cuda.Event,
+    ) -> EncodedChunk: ...
+
+    def decode(
+        self,
+        source: torch.Tensor,
+        output: torch.Tensor,
+        codec_bytes: int,
+        u8_bytes: int,
+        event: torch.cuda.Event,
+    ) -> torch.cuda.Event: ...
 
 
 class ANSCodec:

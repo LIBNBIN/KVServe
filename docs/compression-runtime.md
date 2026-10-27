@@ -6,6 +6,9 @@ remain the responsibility of the transfer/storage adapter.
 
 ## Installation
 
+On the DCU integration branch, use the [DCU guide](dcu_runtime.md) instead of
+installing the CUDA extras below. The public API remains version 1.
+
 Install the package with `runtime` and the nvCOMP extra matching the CUDA major.
 Consumers do not need to clone KVServe or add its source tree to `PYTHONPATH`;
 the current `v1` source archive is built and installed as a normal wheel:
@@ -23,18 +26,17 @@ dependencies, including Humming.
 For KVServe development from a local checkout, use
 `uv pip install '.[runtime,runtime-cu13]'` instead.
 
-The runtime extras do not install `humming-kernels`. Set
-`KVSERVE_COMPRESSION_BACKEND=cpp` in both producer and consumer environments
-before startup to use the CUDA backend without Humming. It requires a CUDA
+The runtime no longer imports `humming-kernels`: the Python backend uses a
+normalized, preallocated-buffer FWHT on CUDA/HIP in both main and worker threads.
+Set `KVSERVE_COMPRESSION_BACKEND=cpp` in both producer and consumer environments
+before startup to use the fused CUDA backend. It requires a CUDA
 compiler and ninja and builds during cache binding, before requests arrive.
 The runtime ships its JIT source files in the wheel. Importing `kvserve_v1` no
 longer loads the optional legacy vLLM connector; its existing exported name is
 resolved when requested.
 
-The backend defaults to `python`. If using that backend with a `transformer`
-stage, install Humming explicitly with `uv pip install 'humming-kernels>=0.1.16'`
-and set `KVSERVE_COMPRESSION_BACKEND=python`. Python pipelines without a
-`transformer` stage do not require Humming.
+The backend defaults to `python`; DCU must use this backend. The legacy connector
+outside `compression.runtime` retains its separate optional dependencies.
 
 The CUDA backend uses cooperative channel/token reductions and quantization,
 preserving the fixed-profile BF16 operation order and buffer layout. Each
@@ -80,8 +82,10 @@ preallocated and owned by the runtime. Encode/decode never perform a network
 operation. Callers can register the single pool and address its slot views.
 
 Supported caches are dense BF16 HND/LBHNC with separate K/V views, including
-different K/V head sizes. Complete blocks enter transform/quantizer/ANS; partial
-tails are transferred raw. Configure `pipeline=["codec"]` for lossless ANS-only.
+different K/V head sizes. Complete blocks enter transform/quantizer/codec; partial
+tails are transferred raw. The default codec is NVIDIA ANS. DCU profiles explicitly
+select `hipcomp_snappy` or `hipcomp_cascaded`; algorithms are never auto-remapped.
+Configure `pipeline=["codec"]` for lossless codec-only transfer.
 Head profiles include TP slicing and replicated KV-head mappings. CUDA supports
 a single FullAttention group; unsupported combinations fail explicitly.
 
@@ -93,7 +97,7 @@ slot until decode completes. Shutdown is safe only after outstanding transfers
 and engine jobs have drained. `shutdown()` fences runtime streams and releases
 its codec resources; it cannot stop remote writes.
 
-Profile version 2 fingerprints the static representation and rejects older
+Profile version 3 fingerprints the static representation and rejects older
 profile versions; both endpoints must be upgraded together. Slot count and the
 local score-file path do not affect peer representation identity.
 
@@ -101,6 +105,11 @@ nvCOMP uses a process-global allocator. While active, KVServe routes its streams
 to fixed workspaces and ordinary external codec streams to independent
 allocations, restoring the SDK default after the last runtime stops. Arbitrary
 external custom nvCOMP allocators are unsupported.
+
+The hipCOMP backend does not register the nvCOMP allocator. Its independently
+versioned native ABI takes a fixed per-slot workspace, charged to the memory
+plan. The initial implementation synchronizes the supplied HIP stream and
+validates per-chunk sizes/status. It cannot use the old DCU snapshot's `.so`.
 
 Numerical/kernel tests live in `tests/runtime`; vLLM separately tests cache
 adaptation, Mooncake integration, disabled behavior and lifecycle safety.

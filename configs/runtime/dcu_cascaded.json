@@ -1,0 +1,9 @@
+{
+  "compression": {
+    "enable-compression-pipeline": true,
+    "codec": "hipcomp_cascaded",
+    "hipcomp_chunk_bytes": 16384,
+    "slot_count": 2,
+    "logical_blocks_per_chunk": 2
+  }
+}

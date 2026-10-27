@@ -83,7 +83,8 @@ class CompressionConfig:
     high_value_num_levels: int = 8
     low_key_num_levels: int = 6
     low_value_num_levels: int = 4
-    codec: Literal["ans"] = "ans"
+    codec: Literal["ans", "hipcomp_snappy", "hipcomp_cascaded"] = "ans"
+    hipcomp_chunk_bytes: int = 16384
     slot_count: int = 2
     logical_blocks_per_chunk: int = 1
     pipeline: tuple[str, ...] = ("transformer", "quantizer", "codec")
@@ -157,8 +158,18 @@ class CompressionConfig:
             raise ValueError(
                 "Mooncake compression only supports transformer='hadamard'."
             )
-        if config.codec != "ans":
-            raise ValueError("Mooncake compression only supports codec='ans'.")
+        if config.codec not in ("ans", "hipcomp_snappy", "hipcomp_cascaded"):
+            raise ValueError(
+                "Unsupported compression codec; select ans, hipcomp_snappy or hipcomp_cascaded."
+            )
+        if (
+            type(config.hipcomp_chunk_bytes) is not int
+            or not 256 <= config.hipcomp_chunk_bytes <= 16 * 1024 * 1024
+            or config.hipcomp_chunk_bytes % 256
+        ):
+            raise ValueError(
+                "hipcomp_chunk_bytes must be a multiple of 256 between 256 and 16777216."
+            )
         if type(config.slot_count) is not int or config.slot_count < 1:
             raise ValueError("Mooncake compression slot_count must be >= 1.")
         if (
